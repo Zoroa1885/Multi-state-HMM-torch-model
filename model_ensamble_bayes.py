@@ -3,16 +3,17 @@ import torch.distributions as dist
 import torch.optim as optim
 import itertools
 from functools import reduce
+from torch import nn
 
 class HMM_bayes(torch.nn.Module):
     """
     Hidden Markov Model with discrete observations.
     """
-    def __init__(self, n_state_list, m_dimensions, max_itterations = 100, tolerance = 0.1, verbose = True, lambda_max_itter = 100, lambda_tol = 10):
+    def __init__(self, n_state_list, m_dimensions, max_itterations = 100, tolerance = 0.1, verbose = True, lambda_max_itter = 100, lambda_tol = 10,use_combine = True ):
         super(HMM_bayes, self).__init__()
         self.n_state_list = n_state_list  # number of states
         self.T_max = None # Max time step
-        self.m_dimensions = m_dimensions
+        self.m_dimensions = m_dimensions 
         self.num_laten_variables = len(self.n_state_list)
         self.dim_to_reduce = tuple(range(1, self.num_laten_variables))
         
@@ -40,6 +41,12 @@ class HMM_bayes(torch.nn.Module):
             self.lambda_list.append(lambda_i)
         self.log_emission_matrix = None
         self.emission_matrix = None
+        
+        # If using the algorithm which fits the combined lambdas
+        self.use_combine = use_combine
+        if use_combine:
+            self.lambda_combined = self.combine_lambdas()
+        
 
         # pi
         self.state_priors_list = []
@@ -64,7 +71,10 @@ class HMM_bayes(torch.nn.Module):
             log_probabilities: FloatTensor of shape (T_max, self.n_states_list)
         """
         # Compute Poisson log probabilities for each lambda in parallel
-        combined_lambdas = self.combine_lambdas()
+        if self.use_combine:
+            combined_lambdas = self.lambda_combined
+        else:
+            combined_lambdas = self.combine_lambdas()
         
         poisson_dist = dist.Poisson(combined_lambdas)
         dim_probs = (x.shape[0],) + tuple(self.n_state_list)
@@ -265,6 +275,7 @@ class HMM_bayes(torch.nn.Module):
                 self.log_transition_matrix_list[i] =  trans_numerator_i - trans_denominator_i.view(-1, 1)
             
             ## Update lambda
+            ### Optimizing indvidual lambdas
             optimizer = optim.Adam(self.parameters(), lr = 0.01)
             lambda_loss = log_likelihood
             for epoch in range(self.lambda_max_itter):
@@ -279,12 +290,16 @@ class HMM_bayes(torch.nn.Module):
                 if lambda_likelihood_change > 0 and lambda_likelihood_change < self.lambda_tol:
                     break
                 lambda_loss = new_lambda_loss
+                
+            
+            ### Optimizing every combination of lambdas.
+            
                     
             
-            lambda_numerator = log_domain_matmul(log_gamma.t(), log_x, dim_1=False)
-            lambda_denominator = log_gamma.logsumexp(dim = 0)
+            # lambda_numerator = log_domain_matmul(log_gamma.t(), log_x, dim_1=False)
+            # lambda_denominator = log_gamma.logsumexp(dim = 0)
             
-            self.lambdas = torch.exp(lambda_numerator - lambda_denominator.view(-1,1))
+            # self.lambdas = torch.exp(lambda_numerator - lambda_denominator.view(-1,1))
             
             
             if self.verbose and iteration == self.max_itterations -1:
@@ -316,8 +331,6 @@ class HMM_bayes(torch.nn.Module):
             log_delta[t, :] = self.log_emission_matrix[t,:] + max_val
             psi[t, :] = argmax_val
 
-        # This next part is a bit tricky to parallelize across the batch,
-        # so we will do it separately for each example.
         z_star = torch.zeros(T_max).long()
         z_star[T_max-1] = log_delta[T_max-1, :].argmax()
         for t in range(T_max-2, -1, -1):
@@ -350,7 +363,7 @@ class HMM_bayes(torch.nn.Module):
             combined_set = torch.stack([torch.sum(list(combo)) for combo in combinations])
             # Reshape the tensor such that it maches the dimensions of the number of states
             lambda_combined[:, m] = combined_set.view(tuple(self.n_state_list))
-
+        
         return lambda_combined
 
     def combine_transition_matrices(self):
@@ -367,6 +380,12 @@ class HMM_bayes(torch.nn.Module):
         return torch.tensor(tensor_list)
     
     
+    def seperation_loss(self, h = 1):
+        combine_lambdas = self.combine_lambdas()
+        loss = nn.MSEloss(combine_lambdas, self.combine_lambdas) 
+        for l in self.lambda_list:
+            loss += h*torch.norm(l)    
+        return loss
     
         
         
@@ -428,15 +447,16 @@ def combination_addition(mat1, mat2):
         for j in range(m):
             comb_mat[i,j,:] = mat1[i,:] + mat2[j,:]
             
-    def combine_lambdas(lambda_list, m_dimensions):
-        dim_tuple = tuple(self.n_state_list)
-        lambda_combined = torch.tensor()
-        for m in m_dimensions:
-            sets = []
-            for element in lambda_list:
-                sets.append(element[m])
-            
-            combinations = []
-            for combo in itertools.product(*sets):
-                combinations.append(torch.stack(list(combo)).sum())
+def combine_lambdas(lambda_list, m_dimensions):
+    dim_tuple = tuple(self.n_state_list)
+    lambda_combined = torch.tensor()
+    for m in m_dimensions:
+        sets = []
+        for element in lambda_list:
+            sets.append(element[m])
         
+        combinations = []
+        for combo in itertools.product(*sets):
+            combinations.append(torch.stack(list(combo)).sum())
+        
+ 
