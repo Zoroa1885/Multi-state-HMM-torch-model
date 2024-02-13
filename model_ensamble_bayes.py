@@ -9,7 +9,7 @@ class HMM_bayes(torch.nn.Module):
     """
     Hidden Markov Model with discrete observations.
     """
-    def __init__(self, n_state_list, m_dimensions, max_itterations = 100, tolerance = 0.1, verbose = True, lambda_max_itter = 100, lambda_tol = 10,use_combine = True ):
+    def __init__(self, n_state_list, m_dimensions, max_itterations = 100, tolerance = 0.1, verbose = True, lambda_max_itter = 100, lambda_tol = 10, use_combine = True ):
         super(HMM_bayes, self).__init__()
         self.n_state_list = n_state_list  # number of states
         self.T_max = None # Max time step
@@ -35,13 +35,14 @@ class HMM_bayes(torch.nn.Module):
         self.transition_matrix_combo = None
         
         # b(x_t)
+        ## Only lambdas are parameters that needs to be optimized
         self.lambda_list = []
         for N in n_state_list:
-            lambda_i = torch.nn.parameter(torch.rand(N, m_dimensions)*10)
+            lambda_i = torch.nn.Parameter(torch.exp(torch.rand(N, m_dimensions)*10))
             self.lambda_list.append(lambda_i)
         self.log_emission_matrix = None
         self.emission_matrix = None
-        
+
         # If using the algorithm which fits the combined lambdas
         self.use_combine = use_combine
         if use_combine:
@@ -275,36 +276,47 @@ class HMM_bayes(torch.nn.Module):
                 self.log_transition_matrix_list[i] =  trans_numerator_i - trans_denominator_i.view(-1, 1)
             
             ## Update lambda
-            ### Optimizing indvidual lambdas
-            optimizer = optim.Adam(self.parameters(), lr = 0.01)
-            lambda_loss = log_likelihood
-            for epoch in range(self.lambda_max_itter):
-                # Optimize
-                optimizer.zero_grad()
-                lambda_loss.backward()
-                optimizer.step()
-                
-                # Calculate new loss
-                new_lambda_loss = self.forward(x)
-                lambda_likelihood_change = lambda_loss - new_lambda_loss
-                if lambda_likelihood_change > 0 and lambda_likelihood_change < self.lambda_tol:
-                    break
-                lambda_loss = new_lambda_loss
-                
-            
             ### Optimizing every combination of lambdas.
+            if self.use_combined:
+                lambda_numerator = log_domain_matmul(log_gamma.t(), log_x, dim_1=False)
+                lambda_denominator = log_gamma.logsumexp(dim = 0)
+                self.lambda_combined = torch.exp(lambda_numerator - lambda_denominator.view(-1,1))
             
+            ### Optimizing indvidual lambdas
+            else:
+                optimizer = optim.Adam(self.parameters(), lr = 0.01)
+                lambda_loss = log_likelihood
+                for epoch in range(self.lambda_max_itter):
+                    # Optimize
+                    optimizer.zero_grad()
+                    lambda_loss.backward()
+                    optimizer.step()
                     
-            
-            # lambda_numerator = log_domain_matmul(log_gamma.t(), log_x, dim_1=False)
-            # lambda_denominator = log_gamma.logsumexp(dim = 0)
-            
-            # self.lambdas = torch.exp(lambda_numerator - lambda_denominator.view(-1,1))
-            
+                    # Calculate new loss
+                    new_lambda_loss = self.forward(x)
+                    lambda_likelihood_change = lambda_loss - new_lambda_loss
+                    if lambda_likelihood_change > 0 and lambda_likelihood_change < self.lambda_tol:
+                        break
+                    lambda_loss = new_lambda_loss
             
             if self.verbose and iteration == self.max_itterations -1:
                 print("Max itteration reached.")
-                
+        
+        # Do a gradient search to find best approximation of seperated lambdas. 
+        optimizer = optim.Adam(self.parameters(), lr = 0.01)
+        lambda_loss = self.seperation_loss()
+        for epoch in range(self.lambda_max_itter):
+            # Optimize
+            optimizer.zero_grad()
+            lambda_loss.backward()
+            optimizer.step()
+            
+            # Calculate new loss
+            new_lambda_loss = self.seperation_loss()
+            lambda_likelihood_change = lambda_loss - new_lambda_loss
+            if lambda_likelihood_change > 0 and lambda_likelihood_change < self.lambda_tol:
+                break
+            lambda_loss = new_lambda_loss
     
     def predict(self, x):
         """

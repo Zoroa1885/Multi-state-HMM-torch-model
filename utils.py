@@ -407,3 +407,17 @@ def correlation_linkage(X):
         idx += 1
     
     return linkage_matrix
+
+
+def unravel_index(index, shape):
+    out = []
+    for dim in reversed(shape):
+        out.append(index % dim)
+        index = index // dim
+    return tuple(reversed(out))
+
+def ravel_index(indices, shape):
+    flattened_index = 0
+    for i in range(len(indices)):
+        flattened_index += indices[i] * (torch.prod(torch.tensor(shape[i+1:])).item() if i+1 < len(shape) else 1)
+    return flattened_index
