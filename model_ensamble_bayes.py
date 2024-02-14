@@ -55,7 +55,7 @@ class HMM_bayes(torch.nn.Module):
         self.state_priors_list = []
         self.log_state_priors_list = []
         for N in n_state_list:
-            state_priors = torch.nn.functional.log_softmax(torch.rand(N)*10)
+            state_priors = torch.nn.functional.log_softmax(torch.rand(N)*10, dim = 0)
             self.state_priors_list.append(state_priors)
             self.log_state_priors_list.append(state_priors.exp())
         self.log_state_priors_combo = None
@@ -190,7 +190,7 @@ class HMM_bayes(torch.nn.Module):
         self.log_emission_matrix = self.emission_model(x)
         log_alpha = self.log_alpha_calc()
 
-        log_prob = log_alpha[self.T_max-1, :].logsumexp()
+        log_prob = log_alpha[self.T_max - 1, :].flatten().logsumexp(dim = 0)
         return log_prob
     
     def get_lambdas(self):
@@ -215,33 +215,20 @@ class HMM_bayes(torch.nn.Module):
         best_log_transition_matrix_list = self.log_transition_matrix_list
         best_lambda_combined = self.lambda_combined
         
-        for iteration in range(self.max_itterations):
-            # Get emission matrix
-            self.log_emission_matrix = self.emission_model(x)
-            
-            self.transition_matrix_combo = self.combine_transition_matrices()
-            self.log_state_priors_combo = self.combine_priors()
+        # Get emission matrix
+        self.log_emission_matrix = self.emission_model(x)
+        
+        # Combine state priors and transition matrix from list of matrices to multidimensional tensor
+        self.transition_matrix_combo = self.combine_transition_matrices()
+        self.log_state_priors_combo = self.combine_priors()
+        
+        ## Calculate log_alpha
+        log_alpha = self.log_alpha_calc()
+        
+        for iteration in range(self.max_itterations):  
             # E step
-            ## Calculate log_alpha
-            log_alpha = self.log_alpha_calc()
-            
             ## Caculcate log_beta
             log_beta = self.log_beta_calc()
-            
-            # Chack for tolerance
-            log_likelihood =  log_alpha[self.T_max - 1, :].flatten().logsumexp(dim = 0)
-            log_likelihood_change = log_likelihood - prev_log_likelihood
-            prev_log_likelihood = log_likelihood
-            if self.verbose:
-                if log_likelihood_change > 0:
-                    print(f"{iteration + 1} {log_likelihood:.4f}  +{log_likelihood_change}")
-                else:
-                    print(f"{iteration + 1} {log_likelihood:.4f}  {log_likelihood_change}")
-            
-            if log_likelihood_change < self.tolerance and log_likelihood_change > 0:
-                if self.verbose:
-                    print("Converged (change in log likelihood within tolerance)")
-                break
             
             ## Calculate log_gamma
             gamma_numerator = log_alpha + log_beta
@@ -309,6 +296,7 @@ class HMM_bayes(torch.nn.Module):
             
             ### Optimizing indvidual lambdas
             else:
+                # Does not work yet
                 optimizer = optim.Adam(self.parameters(), lr = 0.01)
                 lambda_loss = log_likelihood
                 for epoch in range(self.lambda_max_itter):
@@ -324,8 +312,48 @@ class HMM_bayes(torch.nn.Module):
                         break
                     lambda_loss = new_lambda_loss
             
+            # Do necessary calculations for log_likelihood. These will also be used in the next iteration 
+            # Get emission matrix
+            self.log_emission_matrix = self.emission_model(x)
+                   
+            # Combine state priors and transition matrix from list of matrices to multidimensional tensor
+            self.transition_matrix_combo = self.combine_transition_matrices()
+            self.log_state_priors_combo = self.combine_priors()
+                
+            ## Calculate log_alpha
+            log_alpha = self.log_alpha_calc()
+            
+            # Chack for tolerance
+            log_likelihood =  log_alpha[self.T_max - 1, :].flatten().logsumexp(dim = 0)
+            log_likelihood_change = log_likelihood - prev_log_likelihood
+            prev_log_likelihood = log_likelihood 
+            if self.verbose:
+                if log_likelihood_change > 0:
+                    print(f"{iteration + 1} {log_likelihood:.4f}  +{log_likelihood_change}")
+                else:
+                    print(f"{iteration + 1} {log_likelihood:.4f}  {log_likelihood_change}")
+            
+            if log_likelihood > best_log_likelihood:
+                best_log_likelihood = log_likelihood
+                best_log_state_priors_list = self.log_state_priors_list
+                best_log_transition_matrix_list = self.log_transition_matrix_list 
+                best_lambda_combined = self.lambda_combined
+            
+            # Check for max iteration
             if self.verbose and iteration == self.max_itterations -1:
                 print("Max itteration reached.")
+            
+            # Chack for tolerance
+            if log_likelihood_change < self.tolerance and log_likelihood_change > 0:
+                if self.verbose:
+                    print("Converged (change in log likelihood within tolerance)")
+                break
+            
+        
+        # After itteration, use best paramters
+        self.log_state_priors_list = best_log_state_priors_list
+        self.log_transition_matrix_list = best_log_transition_matrix_list 
+        self.lambda_combined = best_lambda_combined
         
         # Sepearate the lambdas from self.lambda_combined, defining new lambda in self.lambda_list
         # self.seperate_lambdas()
@@ -403,29 +431,6 @@ class HMM_bayes(torch.nn.Module):
             
             z_star[t,] = torch.tensor(argmax_index_list[max_ravel_index])
         
-        return z_star
-        # ----------------
-        
-        log_state_priors = torch.nn.functional.log_softmax(self.unnormalized_state_priors, dim=0)
-        log_delta = torch.zeros(T_max, self.n_states).float()
-        psi = torch.zeros(T_max, self.n_states).long()
-        if self.is_cuda:
-            log_delta = log_delta.cuda()
-            psi = psi.cuda()
-
-        self.log_emission_matrix = self.emission_model(x)
-        
-        log_delta[0, :] = self.log_emission_matrix[0,:] + log_state_priors
-        for t in range(1, T_max):
-            max_val, argmax_val = log_domain_matmul(self.log_transition_matrix, log_delta[t-1,:], max = True) # !!! Change
-            log_delta[t, :] = self.log_emission_matrix[t,:] + max_val
-            psi[t, :] = argmax_val
-
-        z_star = torch.zeros(T_max).long()
-        z_star[T_max-1] = log_delta[T_max-1, :].argmax()
-        for t in range(T_max-2, -1, -1):
-            z_star[t] = psi[t+1, z_star[t+1]]
-
         return z_star
 
     def get_transition_matrix(self):
