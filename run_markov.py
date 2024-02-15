@@ -55,14 +55,12 @@ best_model = model_list[np.argmax(score_list)]
 best_pred = best_model.predict(X).numpy()
 
 # Save model and data
-path = f"sim_ensamble_d{data_length}_n{num_neuron_list}_s{num_state_list}_fr{frequency_list}_id={id}"
+path = f"sim_ensamble_d={data_length}_n={num_neuron_list}_s={num_state_list}_fr={frequency_list}_ms={n_state_list}_id={id}"
 
 df_path = f'simulation/{path}/df'+ ".csv"
 y_path = f'simulation/{path}/y'+ ".csv"
 pred_path = f'simulation/{path}/pred'+ ".csv"
 
-
-model_path = path + f"_ms{n_state_list}"
 file_path = f'simulation/{path}/model.pkl'
 os.makedirs(os.path.dirname(file_path), exist_ok=True)
 joblib.dump(model, file_path)
