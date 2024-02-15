@@ -12,7 +12,7 @@ from matplotlib.lines import Line2D
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
 
-import colorcet as cc
+# import colorcet as cc
 
 
 import networkx as nx
@@ -77,7 +77,6 @@ def simulate_state(num_neuron, num_states, frequency, data_length):
     df_states.rename(columns=column_mapping, inplace=True)
 
     return df_states, state_sim
-
 
 def compute_absolute_correlation(df, target_column):
     """
