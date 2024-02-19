@@ -297,6 +297,7 @@ class HMM_bayes(torch.nn.Module):
             ### Optimizing indvidual lambdas
             else:
                 # Does not work yet
+                parameters = self.lambda_list
                 optimizer = optim.Adam(self.parameters(), lr = 0.01)
                 lambda_loss = log_likelihood
                 for epoch in range(self.lambda_max_itter):

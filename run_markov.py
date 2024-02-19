@@ -69,3 +69,7 @@ df_ensamble.to_csv(df_path, index = False)
 np.savetxt(y_path, y_ensamble, delimiter=",")
 np.savetxt(pred_path, best_pred, delimiter=",")
 
+path_name_path = f'simulation/{path}/path_name.txt'
+
+with open(path_name_path, 'w') as f:
+    f.write(path)
