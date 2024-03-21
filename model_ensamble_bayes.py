@@ -9,7 +9,7 @@ class HMM_bayes(torch.nn.Module):
     """
     Hidden Markov Model with discrete observations.
     """
-    def __init__(self, n_state_list, m_dimensions, max_itterations = 100, tolerance = 0.1, verbose = True, lambda_max_itter = 100, lambda_tol = 10, use_combine = True ):
+    def __init__(self, n_state_list, m_dimensions, max_iterations = 100, tolerance = 0.1, verbose = True, lambda_max_iter = 10, lambda_tol = 10, lambda_learning_rate = 0.1, use_combine = True, early_stop_patience = 3, lambda_initate_list = None):
         super(HMM_bayes, self).__init__()
         self.n_state_list = n_state_list  # number of states
         self.tot_dim = reduce(lambda x, y : x * y, self.n_state_list) # Product of all states
@@ -19,10 +19,12 @@ class HMM_bayes(torch.nn.Module):
         self.num_laten_variables = len(self.n_state_list)
         self.dim_to_reduce = tuple(range(1, self.num_laten_variables+1))
         
-        self.lambda_max_itter = lambda_max_itter
+        self.lambda_max_iter = lambda_max_iter
         self.lambda_tol = lambda_tol
+        self.lambda_learning_rate = lambda_learning_rate
+        self.early_stop_patience = early_stop_patience
         
-        self.max_itterations = max_itterations
+        self.max_iterations = max_iterations
         self.tolerance = tolerance
         
         self.verbose = verbose
@@ -31,17 +33,25 @@ class HMM_bayes(torch.nn.Module):
         self.transition_matrix_list = []
         self.log_transition_matrix_list = []
         for N in n_state_list:
-            transition_matrix = torch.nn.functional.softmax(torch.randn(N,N)*10, dim = 0)
+            transition_matrix = nn.functional.softmax(torch.randn(N,N), dim = 0)
             self.transition_matrix_list.append(transition_matrix)
             self.log_transition_matrix_list.append(transition_matrix.log())
         self.transition_matrix_combo = None
         
         # b(x_t)
         ## Only lambdas are parameters that needs to be optimized
-        self.lambda_list = []
-        for N in n_state_list:
-            lambda_i = torch.nn.Parameter(torch.exp(torch.rand(N, m_dimensions)*10))
-            self.lambda_list.append(lambda_i)
+        self.unnormalized_lambda_list = nn.ParameterList([
+            nn.Parameter(torch.randn(N, m_dimensions))
+            for N in n_state_list
+        ])
+        if lambda_initate_list == None:
+            self.lambda_list = [torch.exp(lambdas) for lambdas in self.unnormalized_lambda_list]
+        else:
+            self.lambda_list = lambda_initate_list
+            self.unnormalized_lambda_list = nn.ParameterList([nn.Parameter(torch.log(lambdas + 1e-16)) for lambdas in self.lambda_list])
+
+        self.base_rate = nn.Parameter(torch.randn(1))
+        
         self.log_emission_matrix = None
         self.emission_matrix = None
 
@@ -73,12 +83,13 @@ class HMM_bayes(torch.nn.Module):
         Returns:
             log_probabilities: FloatTensor of shape (T_max, self.n_states_list)
         """
+        
+
         # Compute Poisson log probabilities for each lambda in parallel
         if self.use_combine:
             combined_lambdas = self.lambda_combined
         else:
             combined_lambdas = self.combine_lambdas()
-        
         poisson_dist = dist.Poisson(combined_lambdas)
         dim_probs = (x.shape[0],) + tuple(self.n_state_list)
         log_probabilities = torch.zeros(dim_probs).float()
@@ -213,7 +224,10 @@ class HMM_bayes(torch.nn.Module):
         best_log_likelihood = float('-inf')
         best_log_state_priors_list = self.log_state_priors_list
         best_log_transition_matrix_list = self.log_transition_matrix_list
-        best_lambda_combined = self.lambda_combined
+        if self.use_combine:
+            best_lambda_combined = self.lambda_combined
+        else: 
+            best_lambda_list = self.lambda_list
         
         # Get emission matrix
         self.log_emission_matrix = self.emission_model(x)
@@ -225,7 +239,10 @@ class HMM_bayes(torch.nn.Module):
         ## Calculate log_alpha
         log_alpha = self.log_alpha_calc()
         
-        for iteration in range(self.max_itterations):  
+        ## Calculate inital log_likelihood
+        log_likelihood = log_alpha[self.T_max - 1, :].flatten().logsumexp(dim = 0)
+        
+        for iteration in range(self.max_iterations):  
             # E step
             ## Caculcate log_beta
             log_beta = self.log_beta_calc()
@@ -280,6 +297,7 @@ class HMM_bayes(torch.nn.Module):
                 
                 self.log_transition_matrix_list[i] =  trans_numerator_i - trans_denominator_i.view(-1, 1)
             
+            
             ## Update lambda
             ### Optimizing every combination of lambdas.
             if self.use_combine:
@@ -297,18 +315,25 @@ class HMM_bayes(torch.nn.Module):
             ### Optimizing indvidual lambdas
             else:
                 # Does not work yet
-                parameters = self.lambda_list
-                optimizer = optim.Adam(self.parameters(), lr = 0.01)
-                lambda_loss = log_likelihood
-                for epoch in range(self.lambda_max_itter):
+                lambda_loss = -log_likelihood  # Need (-) because optim minimizes loss
+                optimizer = optim.Adam(self.parameters(), lr = self.lambda_learning_rate)
+                for epoch in range(self.lambda_max_iter):
                     # Optimize
                     optimizer.zero_grad()
-                    lambda_loss.backward()
+                    lambda_loss.backward(retain_graph=True)
+                    
                     optimizer.step()
                     
                     # Calculate new loss
-                    new_lambda_loss = self.forward(x)
-                    lambda_likelihood_change = lambda_loss - new_lambda_loss
+                    new_lambda_loss = -self.forward(x) # Need (-) because optim minimizes loss
+                    lambda_likelihood_change = -(new_lambda_loss - lambda_loss)
+                    
+                    if self.verbose:
+                        if lambda_likelihood_change > 0:
+                            print(f"Lambda fiting: {epoch + 1} {-new_lambda_loss:.4f}  +{lambda_likelihood_change}")
+                        else:
+                            print(f"Lambda fiting: {epoch + 1} {-new_lambda_loss:.4f}  {lambda_likelihood_change}")
+                    
                     if lambda_likelihood_change > 0 and lambda_likelihood_change < self.lambda_tol:
                         break
                     lambda_loss = new_lambda_loss
@@ -338,11 +363,15 @@ class HMM_bayes(torch.nn.Module):
                 best_log_likelihood = log_likelihood
                 best_log_state_priors_list = self.log_state_priors_list
                 best_log_transition_matrix_list = self.log_transition_matrix_list 
-                best_lambda_combined = self.lambda_combined
+                
+                if self.use_combine:
+                    best_lambda_combined = self.lambda_combined
+                else:
+                    best_lambda_list = self.lambda_list
             
             # Check for max iteration
-            if self.verbose and iteration == self.max_itterations -1:
-                print("Max itteration reached.")
+            if self.verbose and iteration == self.max_iterations -1:
+                print("Max iteration reached.")
             
             # Chack for tolerance
             if log_likelihood_change < self.tolerance and log_likelihood_change > 0:
@@ -351,29 +380,17 @@ class HMM_bayes(torch.nn.Module):
                 break
             
         
-        # After itteration, use best paramters
+        # After iteration, use best paramters
         self.log_state_priors_list = best_log_state_priors_list
         self.log_transition_matrix_list = best_log_transition_matrix_list 
-        self.lambda_combined = best_lambda_combined
+        if self.use_combine:
+            self.lambda_combined = best_lambda_combined
+        else: 
+            self.lambda_list = best_lambda_list
         
-        # Sepearate the lambdas from self.lambda_combined, defining new lambda in self.lambda_list
-        # self.seperate_lambdas()
-        
-        # # Do a gradient search to find best approximation of seperated lambdas. 
-        # optimizer = optim.Adam(self.parameters(), lr = 0.01)
-        # lambda_loss = self.seperation_loss()
-        # for epoch in range(self.lambda_max_itter):
-        #     # Optimize
-        #     optimizer.zero_grad()
-        #     lambda_loss.backward()
-        #     optimizer.step()
-            
-        #     # Calculate new loss
-        #     new_lambda_loss = self.seperation_loss()
-        #     lambda_likelihood_change = lambda_loss - new_lambda_loss
-        #     if lambda_likelihood_change > 0 and lambda_likelihood_change < self.lambda_tol:
-        #         break
-        #     lambda_loss = new_lambda_loss
+        # Separate the lambdas from self.lambda_combined, defining new lambda in self.lambda_list
+        # self.separate_lambdas_optim()
+        # self.lambda_combined = self.combine_lambdas(normalized=False)
     
     def predict(self, x):
         """
@@ -437,7 +454,7 @@ class HMM_bayes(torch.nn.Module):
     def get_transition_matrix(self):
         return torch.exp(self.log_transition_matrix)
     
-    def combine_lambdas(self):
+    def combine_lambdas(self, normalized = True):
         """Combines every possible combination of lambdas and adds them togheter
 
         Returns:
@@ -445,14 +462,19 @@ class HMM_bayes(torch.nn.Module):
         """
         dim_tuple = (self.m_dimensions,)  + tuple(self.n_state_list)
         lambda_combined = torch.zeros(dim_tuple, dtype=torch.float)
+        
+        if normalized:
+            lambda_list = self.lambda_list
+        else:
+            lambda_list = [torch.exp(lambdas) for lambdas in self.unnormalized_lambda_list]
 
         # Data on the on the form x = (x_1,...,x_m), where each x_i has T_max number of time steps
-        # We itterate over each dimension and caclulate the combined lambdas
+        # We iterate over each dimension and caclulate the combined lambdas
         # for each dimension
         combined_list = []
         for m in range(self.m_dimensions):
             # A list of all lambdas for that dimension in every statespace
-            sets = [torch.select(element, -1, m) for element in self.lambda_list]
+            sets = [torch.select(element, -1, m) for element in lambda_list]
 
             # Find every possible combination of lambdas
             combinations = []
@@ -471,8 +493,27 @@ class HMM_bayes(torch.nn.Module):
         
         lambda_combined = torch.permute(lambda_combined, new_dim)
         
+        # Add base rate
+        lambda_combined = lambda_combined + self.base_rate
+        
         return lambda_combined
 
+    def simple_separate_lambdas(self):
+        reverse_dim = (self.num_laten_variables,) + tuple(range(self.num_laten_variables))
+        lambda_combined_perm = torch.permute(self.lambda_combined, reverse_dim)
+        
+        new_lambda_list = [torch.zeros(n, self.m_dimensions).float() for n in self.n_state_list]
+        for m in range(self.m_dimensions):             
+            tot_lambda = lambda_combined_perm[m,:].sum().item()
+            lambda_estimate = tot_lambda/(self.tot_dim*self.num_laten_variables)
+            
+            for i in range(self.num_laten_variables):
+                new_lambda_list[i][:,m] = lambda_estimate
+        
+        self.lambda_list = new_lambda_list
+            
+            
+    
     def combine_transition_matrices(self):
         tensor_list = []
         sets = []
@@ -495,12 +536,19 @@ class HMM_bayes(torch.nn.Module):
         
         return combined_set
     
-    def seperation_loss(self, h=1):
-        combine_lambdas = self.combine_lambdas() # Combine self.lambda_list into sums of all possible combinations
-        loss = nn.MSEloss(combine_lambdas, self.lambda_combined) 
+    def separation_loss(self,h = 1, M=1e+10):
+        combine_lambdas = self.combine_lambdas(normalized=False) + torch.exp(self.base_rate) # Combine self.lambda_list into sums of all possible combinations and add base rate
+        lambda_list = [torch.exp(lambdas) for lambdas in self.unnormalized_lambda_list]
+        
+        loss_function = nn.MSELoss()
+        loss = loss_function(combine_lambdas, self.lambda_combined)
+        if self.verbose:
+            print(f"Pure separation loss: {loss.item()}")
+
         # Add a penalty to the size of lambdas
-        for l in self.lambda_list:
-            loss += h*torch.norm(l)    
+        # for l in lambda_list:
+        #     loss += h*torch.sum(torch.abs(l)) # Lasso penalty to squeez lambdas towards zero 
+        
         return loss
     
     def log_domain_matmul(self, log_A, log_B, dim_1 = True, max = False):
@@ -539,7 +587,65 @@ class HMM_bayes(torch.nn.Module):
         out = torch.logsumexp(elementwise_sum, dim = -2)
         return out
     
-    def seperate_lambdas(self):
+    # def separate_lambdas_optim(self):
+    #     lambda_loss = self.separation_loss()
+    #     optimizer = optim.Adam(self.parameters(), lr = self.lambda_learning_rate)
+    #     for epoch in range(self.lambda_max_iter):
+    #         # Optimize
+    #         optimizer.zero_grad()
+    #         lambda_loss.backward(retain_graph=True)
+            
+    #         # for param in self.parameters():
+    #         #     param.grad.data.clamp_(min=1e-16)
+            
+    #         optimizer.step()
+            
+    #         # Calculate new loss
+    #         new_lambda_loss = self.separation_loss() 
+    #         lambda_loss_change = new_lambda_loss - lambda_loss
+            
+    #         if self.verbose:
+    #             if lambda_loss_change > 0:
+    #                 print(f"Lambda separation loss: {epoch + 1} {new_lambda_loss:.4f}  +{lambda_loss_change}")
+    #             else:
+    #                 print(f"Lambda separation loss: {epoch + 1} {new_lambda_loss:.4f}  {lambda_loss_change}")
+            
+    #         if lambda_loss_change > 0 and lambda_loss_change < self.lambda_tol:
+    #             break
+    #         lambda_loss = new_lambda_loss
+            
+    def separate_lambdas_optim(self):
+        # Initialize optimizer
+        optimizer = optim.Adam(self.parameters(), lr = self.lambda_learning_rate)
+
+        best_loss = float('inf')  # Track the best loss for early stopping
+        early_stop_counter = 0  # Counter for early stopping
+
+        for epoch in range(self.lambda_max_iter):
+            # Optimize
+            optimizer.zero_grad()
+            lambda_loss = self.separation_loss()
+            lambda_loss.backward(retain_graph=True)
+            optimizer.step()
+
+            # Early stopping
+            if lambda_loss < best_loss:
+                best_loss = lambda_loss
+                early_stop_counter = 0
+            else:
+                early_stop_counter += 1
+
+            if early_stop_counter >= self.early_stop_patience:
+                print(f"Stopping early at epoch {epoch+1} due to no improvement in loss.")
+                break
+
+            if self.verbose:
+                print(f"Lambda separation loss at epoch {epoch+1}: {lambda_loss.item()}")
+
+        return best_loss
+
+    
+    def separate_lambdas(self):
         # NOTE: Does not work since may return negative lambda values. 
         new_dim = (self.num_laten_variables,) + tuple(range(self.num_laten_variables))
         lambda_combined_perm = torch.permute(self.lambda_combined, new_dim)
@@ -556,7 +662,7 @@ class HMM_bayes(torch.nn.Module):
                 lambda_combined_reduced = lambda_combined_m.sum(dim = dim_reduce_i)
                 
                 my = (n**2 - n)*t/n
-                # Itterate until the value of lambdas stabilize
+                # Iterate until the value of lambdas stabilize
                 for _ in range(10):
                     A = n*(t+my)*torch.eye(n) - t*torch.ones(n,n)
                     B = n * (n * lambda_combined_reduced - tot_lambda * torch.ones(n))

@@ -66,17 +66,18 @@ def simulate_state(num_neuron, num_states, frequency, data_length):
 
     rate_state = np.zeros((num_neuron, data_length))
     spikes_state = np.zeros((num_neuron, data_length))
-
+    
 
     rate_state = rate_mat[:, state_sim - 1]
     spikes_state = np.random.poisson(lam=rate_state)
     
     df_states = pd.DataFrame(spikes_state.T)
+    df_rate = pd.DataFrame(rate_mat.T)
     column_mapping = {col: f'state_neuron_{col}' for col in df_states.columns}
     # Rename the columns using the mapping
     df_states.rename(columns=column_mapping, inplace=True)
 
-    return df_states, state_sim
+    return df_states, state_sim, df_rate 
 
 def compute_absolute_correlation(df, target_column):
     """
