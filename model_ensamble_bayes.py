@@ -9,7 +9,7 @@ class HMM_bayes(torch.nn.Module):
     """
     Hidden Markov Model with discrete observations.
     """
-    def __init__(self, n_state_list, m_dimensions, max_iterations = 100, tolerance = 0.1, verbose = True, lambda_max_iter = 10, lambda_tol = 10, lambda_learning_rate = 0.1, use_combine = True, early_stop_patience = 3, lambda_initate_list = None):
+    def __init__(self, n_state_list, m_dimensions, max_iterations = 100, tolerance = 0.1, verbose = True, lambda_max_iter = 10, lambda_tol = 10, lambda_learning_rate = 0.1, use_combine = True, early_stop_patience = 3, lambda_initate_list = None, one_to_rule_all_interval = None, strong = False):
         super(HMM_bayes, self).__init__()
         self.n_state_list = n_state_list  # number of states
         self.tot_dim = reduce(lambda x, y : x * y, self.n_state_list) # Product of all states
@@ -28,6 +28,10 @@ class HMM_bayes(torch.nn.Module):
         self.tolerance = tolerance
         
         self.verbose = verbose
+
+        # One to rule all stuff
+        self.otra_interval = one_to_rule_all_interval
+        self.strong = strong
         
         # A
         self.transition_matrix_list = []
@@ -41,7 +45,7 @@ class HMM_bayes(torch.nn.Module):
         # b(x_t)
         ## Only lambdas are parameters that needs to be optimized
         self.unnormalized_lambda_list = nn.ParameterList([
-            nn.Parameter(torch.randn(N, m_dimensions))
+            nn.Parameter(torch.abs(torch.randn(N, m_dimensions)))
             for N in n_state_list
         ])
         if lambda_initate_list == None:
@@ -89,7 +93,7 @@ class HMM_bayes(torch.nn.Module):
         if self.use_combine:
             combined_lambdas = self.lambda_combined
         else:
-            combined_lambdas = self.combine_lambdas()
+            combined_lambdas = self.combine_lambdas(normalized=False)
         poisson_dist = dist.Poisson(combined_lambdas)
         dim_probs = (x.shape[0],) + tuple(self.n_state_list)
         log_probabilities = torch.zeros(dim_probs).float()
@@ -204,11 +208,122 @@ class HMM_bayes(torch.nn.Module):
         log_prob = log_alpha[self.T_max - 1, :].flatten().logsumexp(dim = 0)
         return log_prob
     
-    def get_lambdas(self):
-        return self.lambdas_list
-            
     
-    def fit(self, x):
+    def loss_function(self, x, h = 1000):
+        loss = -self.forward(x)
+        lambda_list = [torch.exp(lambdas) for lambdas in self.unnormalized_lambda_list]
+        for lam in lambda_list:
+            loss += h*torch.norm(lam)
+        
+        return loss
+    
+    def fit_optim(self, x, h = 1000):
+        """
+        One step optimization function for lambdas.
+        """
+        self.T_max = x.shape[0]
+        prev_log_likelihood = float('-inf')
+        log_x = torch.log(x + 1e-16)
+        
+        best_loss= float('-inf')
+        best_log_state_priors_list = self.log_state_priors_list
+        best_log_transition_matrix_list = self.log_transition_matrix_list
+        best_unnormalized_lambda_list = self.unnormalized_lambda_list
+
+        lambda_loss = self.loss_function(x, h=h)  
+        optimizer = optim.Adam(self.parameters(), lr = self.lambda_learning_rate)
+        for epoch in range(self.lambda_max_iter): 
+            # Lambda optimization step
+            optimizer.zero_grad()
+            lambda_loss.backward(retain_graph=True)
+            
+            optimizer.step()
+            
+            # Update normalized lambdas
+            self.lambda_list = [torch.exp(lambdas) for lambdas in self.unnormalized_lambda_list]
+            
+            # Optimization of probabilities : E step
+            # Get emission matrix
+            self.log_emission_matrix = self.emission_model(x)
+            
+            # Combine state priors and transition matrix from list of matrices to multidimensional tensor
+            self.transition_matrix_combo = self.combine_transition_matrices()
+            self.log_state_priors_combo = self.combine_priors()
+
+            ## Calculate log_alpha
+            log_alpha = self.log_alpha_calc()
+            ## Caculcate log_beta
+            log_beta = self.log_beta_calc()
+            
+            ## Calculate log_gamma
+            gamma_numerator = log_alpha + log_beta
+            gamma_denominator = gamma_numerator.logsumexp(dim=self.dim_to_reduce, keepdim=True)
+            
+            log_gamma = gamma_numerator - gamma_denominator.expand_as(gamma_numerator)
+            
+            log_gamma_list = []
+            log_emission_matrix_list = []
+            log_alpha_list = []
+            log_beta_list = []
+            for i in range(self.num_laten_variables):
+                dim_reduce_i = tuple(list(self.dim_to_reduce)[:i] + list(self.dim_to_reduce)[i + 1:])
+                # dim_reduce_i = tuple(list(self.dim_to_reduce).remove(i+1))
+                
+                log_gamma_i = log_gamma.logsumexp(dim = dim_reduce_i) 
+                log_gamma_list.append(log_gamma_i)
+                
+                log_emission_matrix_i = self.log_emission_matrix.logsumexp(dim = dim_reduce_i)
+                log_emission_matrix_list.append(log_emission_matrix_i)
+                
+                log_alpha_i = log_alpha.logsumexp(dim = dim_reduce_i)
+                log_alpha_list.append(log_alpha_i)
+                
+                log_beta_i = log_beta.logsumexp(dim = dim_reduce_i)
+                log_beta_list.append(log_beta_i)
+            
+            ## Calculate log_xi
+            log_xi_list = []
+            for i in range(self.num_laten_variables):
+                xi_numerator_i = (log_alpha_list[i][:-1, :, None] + self.log_transition_matrix_list[i][None, :, :] + log_beta_list[i][1:, None, :] + log_emission_matrix_list[i][1:, None, :])
+                xi_denominator = xi_numerator_i.logsumexp(dim = (1,2), keepdim=True)
+                
+                log_xi_i = xi_numerator_i - xi_denominator
+                log_xi_list.append(log_xi_i)
+                
+            # M step
+            ## Update pi
+            for i in range(len(self.n_state_list)):
+                log_gamma_i = log_gamma_list[i]
+                self.log_state_priors_list[i] = log_gamma_i[0,] - log_gamma_i.logsumexp(dim = 0)
+            
+            ## Updaten transition matrix
+            for i in range(self.num_laten_variables):
+                trans_numerator_i = log_xi_list[i].logsumexp(dim = 0)
+                trans_denominator_i = log_gamma_list[i][0:(self.T_max-1),:].logsumexp(dim = 0)
+                
+                self.log_transition_matrix_list[i] =  trans_numerator_i - trans_denominator_i.view(-1, 1)         
+
+            # Calculate new loss
+            new_lambda_loss = self.loss_function(x, h=h)
+            lambda_likelihood_change = -(new_lambda_loss - lambda_loss)
+            
+            if self.verbose:
+                if lambda_likelihood_change > 0:
+                    print(f"Lambda fiting: {epoch + 1} {-new_lambda_loss:.4f}  +{lambda_likelihood_change}")
+                else:
+                    print(f"Lambda fiting: {epoch + 1} {-new_lambda_loss:.4f}  {lambda_likelihood_change}")
+            
+            lambda_loss = new_lambda_loss
+            if lambda_loss > best_loss:
+                best_loss = lambda_loss
+                best_log_state_priors_list = self.log_state_priors_list
+                best_log_transition_matrix_list = self.log_transition_matrix_list    
+
+            if lambda_likelihood_change > 0 and lambda_likelihood_change < self.lambda_tol:
+                break
+
+
+    def fit(self, x, use_combine = True):
         """ Estimates optimal transition matrix and lambdas given the data x.
 
         Args:
@@ -216,6 +331,7 @@ class HMM_bayes(torch.nn.Module):
             log_alpha (torch) : T_max x N
             log_beta (torch) : T_max x N
         """
+        self.use_combine = use_combine
         
         self.T_max = x.shape[0]
         prev_log_likelihood = float('-inf')
@@ -241,9 +357,34 @@ class HMM_bayes(torch.nn.Module):
         
         ## Calculate inital log_likelihood
         log_likelihood = log_alpha[self.T_max - 1, :].flatten().logsumexp(dim = 0)
+
+        # otra stuff
+        otra_count = 0
         
         for iteration in range(self.max_iterations):  
-            # E step
+            # One to rule all rebalance
+            if self.otra_interval:
+                if otra_count < len(self.otra_interval):
+                    if iteration == self.otra_interval[otra_count]:
+                        otra_count += 1
+                        if self.verbose:
+                            print("One to rule all used")
+                        if self.strong:
+                            self.lambda_list = self.one_to_rule_all_strong()
+                        else: 
+                            self.lambda_list = self.one_to_rule_all()
+                        self.lambda_combined = self.combine_lambdas()
+                        # E step
+                        ## Get emission matrix
+                        self.log_emission_matrix = self.emission_model(x)
+
+                        ## Combine state priors and transition matrix from list of matrices to multidimensional tensor
+                        self.transition_matrix_combo = self.combine_transition_matrices()
+                        self.log_state_priors_combo = self.combine_priors()
+                        
+                        ## Calculate log_alpha
+                        log_alpha = self.log_alpha_calc()
+            #E step
             ## Caculcate log_beta
             log_beta = self.log_beta_calc()
             
@@ -315,7 +456,7 @@ class HMM_bayes(torch.nn.Module):
             ### Optimizing indvidual lambdas
             else:
                 # Does not work yet
-                lambda_loss = -log_likelihood  # Need (-) because optim minimizes loss
+                lambda_loss = self.loss_function(x)  
                 optimizer = optim.Adam(self.parameters(), lr = self.lambda_learning_rate)
                 for epoch in range(self.lambda_max_iter):
                     # Optimize
@@ -324,8 +465,11 @@ class HMM_bayes(torch.nn.Module):
                     
                     optimizer.step()
                     
+                    # Update normalized lambdas
+                    self.lambda_list = [torch.exp(lambdas) for lambdas in self.unnormalized_lambda_list]
+
                     # Calculate new loss
-                    new_lambda_loss = -self.forward(x) # Need (-) because optim minimizes loss
+                    new_lambda_loss = self.loss_function(x) # Need (-) because optim minimizes loss
                     lambda_likelihood_change = -(new_lambda_loss - lambda_loss)
                     
                     if self.verbose:
@@ -372,6 +516,7 @@ class HMM_bayes(torch.nn.Module):
             # Check for max iteration
             if self.verbose and iteration == self.max_iterations -1:
                 print("Max iteration reached.")
+                break
             
             # Chack for tolerance
             if log_likelihood_change < self.tolerance and log_likelihood_change > 0:
@@ -389,8 +534,8 @@ class HMM_bayes(torch.nn.Module):
             self.lambda_list = best_lambda_list
         
         # Separate the lambdas from self.lambda_combined, defining new lambda in self.lambda_list
-        # self.separate_lambdas_optim()
-        # self.lambda_combined = self.combine_lambdas(normalized=False)
+        # self.simple_separate_lambdas()
+        # self.lambda_combined = self.combine_lambdas(normalized=True)
     
     def predict(self, x):
         """
@@ -511,7 +656,7 @@ class HMM_bayes(torch.nn.Module):
                 new_lambda_list[i][:,m] = lambda_estimate
         
         self.lambda_list = new_lambda_list
-            
+        self.unnormalized_lambda_list = nn.ParameterList([nn.Parameter(torch.log(lambdas + 1e-16)) for lambdas in self.lambda_list])
             
     
     def combine_transition_matrices(self):
@@ -644,6 +789,62 @@ class HMM_bayes(torch.nn.Module):
 
         return best_loss
 
+    def one_to_rule_all(self):
+        """
+        tensor : Tensor of shape (m_dimensions, (n_state_list))
+        """
+        tensor_raw = self.lambda_combined
+        new_dim = (self.num_laten_variables,) + tuple(range(self.num_laten_variables))
+        tensor = tensor_raw.permute(new_dim)
+        
+        lambda_list = [torch.zeros(n, self.m_dimensions) for n in self.n_state_list]
+        for m in range(self.m_dimensions):
+            sub_tensor = tensor[m]
+            laten_max_rate_list = []
+            list_of_rate_lists = []
+            for i in range(len(self.n_state_list)):
+                laten_rates_list = []
+                for n in range(self.n_state_list[i]):
+                    laten_state_rates = sub_tensor.select(index = n, dim = i)
+                    laten_rates_list.append(torch.mean(laten_state_rates).item())
+                laten_max_rate_list.append(max(laten_rates_list))
+                list_of_rate_lists.append(laten_rates_list)
+            best_laten = np.argmax(laten_max_rate_list)
+            lambda_list[best_laten][:,m] = torch.tensor(list_of_rate_lists[best_laten])
+        
+        return lambda_list
+    
+    def one_to_rule_all_strong(self):
+        """
+        tensor : Tensor of shape (m_dimensions, (n_state_list))
+        """
+        tensor_raw = self.lambda_combined
+        new_dim = (self.num_laten_variables,) + tuple(range(self.num_laten_variables))
+        tensor = tensor_raw.permute(new_dim)
+        
+        lambda_list = [torch.zeros(n, self.m_dimensions) for n in self.n_state_list]
+        for m in range(self.m_dimensions):
+            sub_tensor = tensor[m]
+            laten_max_rate_list = []
+            list_of_rate_lists = []
+            for i in range(len(self.n_state_list)):
+                laten_rates_list = []
+                for n in range(self.n_state_list[i]):
+                    laten_state_rates = sub_tensor.select(index = n, dim = i)
+                    laten_rates_list.append(torch.mean(laten_state_rates).item())
+                laten_max_rate_list.append(max(laten_rates_list))
+                list_of_rate_lists.append(laten_rates_list)
+            best_laten = np.argmax(laten_max_rate_list)
+            best_laten_list = list_of_rate_lists[best_laten]
+            best_state = np.argmax(best_laten_list)
+
+            new_state_list = torch.zeros([len(best_laten_list)]).float()
+            new_state_list[best_state] = np.sum(best_laten_list)
+            
+            lambda_list[best_laten][:,m] = new_state_list
+        
+        return lambda_list
+
     
     def separate_lambdas(self):
         # NOTE: Does not work since may return negative lambda values. 
@@ -676,7 +877,7 @@ class HMM_bayes(torch.nn.Module):
                     my = new_my
                 
                 self.lambda_list[i][:,m] = lambda_m_i
-        
+
 
     
         
@@ -779,3 +980,5 @@ def combine_lambdas(lambda_list, m_dimensions):
         for combo in itertools.product(*sets):
             combinations.append(torch.stack(list(combo)).sum())
  
+def convert_to_zero(input_tensor, threshold=1e-10):
+    return torch.where(input_tensor < threshold, torch.tensor(0.0), input_tensor)
